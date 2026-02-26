@@ -1,6 +1,6 @@
 /*
 Caddy v2 module to filter requests based on source IP geographic location. This was a feature provided by the V1 ipfilter middleware.
-Complete documentation and usage examples are available at https://github.com/porech/caddy-maxmind-geolocation
+Complete documentation and usage examples are available at https://github.com/DoMaLo/caddy-maxmind-geolocation
 */
 package caddy_maxmind_geolocation
 
@@ -148,7 +148,7 @@ The matcher configuration will have a single block with the following parameters
 You will want specify just one of `allow_***` or `deny_ééé`. If you
 specify both of them, denied items will take precedence over allowed ones.
 
-Examples are available at https://github.com/porech/caddy-maxmind-geolocation/
+Examples are available at https://github.com/DoMaLo/caddy-maxmind-geolocation/
 */
 func (m *MaxmindGeolocation) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	current := 0
