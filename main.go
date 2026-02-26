@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
+	"time"
 
 	"slices"
 
@@ -30,14 +32,25 @@ var (
 )
 
 func init() {
-	caddy.RegisterModule(MaxmindGeolocation{})
+	caddy.RegisterModule(new(MaxmindGeolocation))
 }
 
 // Allows to filter requests based on source IP country.
 type MaxmindGeolocation struct {
 
-	// The path of the MaxMind GeoLite2-Country.mmdb file.
+	// The path of the MaxMind GeoLite2-Country.mmdb file. Not used when GitHub source is set.
 	DbPath string `json:"db_path"`
+
+	// GitHub source: repo in form owner/repo (e.g. P3TERX/GeoLite.mmdb).
+	GitHubRepo string `json:"github_repo,omitempty"`
+	// GitHub asset name from latest release (e.g. GeoLite2-Country.mmdb).
+	GitHubAsset string `json:"github_asset,omitempty"`
+	// Local path where the downloaded DB is stored. Required when using GitHub.
+	CachePath string `json:"cache_path,omitempty"`
+	// Optional token for GitHub API (higher rate limit, private repos).
+	GitHubToken string `json:"github_token,omitempty"`
+	// How often to check for updates (e.g. 24h). Default 24h.
+	UpdateInterval caddy.Duration `json:"update_interval,omitempty"`
 
 	// A list of countries that the filter will allow.
 	// If you specify this, you should not specify DenyCountries.
@@ -95,14 +108,26 @@ type MaxmindGeolocation struct {
 	// You can specify the special value "UNK" to match unrecognized ASNs.
 	DenyASN []string `json:"deny_asn"`
 
-	dbInst *maxminddb.Reader
-	logger *zap.Logger
+	dbInst   *maxminddb.Reader
+	dbMu     sync.Mutex
+	logger   *zap.Logger
+	stopSync chan struct{}
 }
 
 /*
 The matcher configuration will have a single block with the following parameters:
 
-- `db_path`: required, is the path to the GeoLite2-Country.mmdb file
+- `db_path`: path to the GeoLite2-Country.mmdb file (required if not using GitHub)
+
+- `github_repo`: optional, GitHub repo owner/name (e.g. P3TERX/GeoLite.mmdb)
+
+- `github_asset`: optional, asset filename in latest release (e.g. GeoLite2-Country.mmdb)
+
+- `cache_path`: optional, local path to store downloaded DB when using GitHub
+
+- `github_token`: optional, GitHub token for API (env: GITHUB_TOKEN)
+
+- `update_interval`: optional, how often to check for updates (e.g. 24h), default 24h
 
 - `allow_countries`: a space-separated list of allowed countries
 
@@ -148,10 +173,39 @@ func (m *MaxmindGeolocation) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				current = 8
 			case "deny_asn":
 				current = 9
+			case "github_repo":
+				current = 10
+			case "github_asset":
+				current = 11
+			case "cache_path":
+				current = 12
+			case "github_token":
+				current = 13
+			case "update_interval":
+				current = 14
 			default:
 				switch current {
 				case 1:
 					m.DbPath = d.Val()
+					current = 0
+				case 10:
+					m.GitHubRepo = d.Val()
+					current = 0
+				case 11:
+					m.GitHubAsset = d.Val()
+					current = 0
+				case 12:
+					m.CachePath = d.Val()
+					current = 0
+				case 13:
+					m.GitHubToken = d.Val()
+					current = 0
+				case 14:
+					dur, err := caddy.ParseDuration(d.Val())
+					if err != nil {
+						return fmt.Errorf("update_interval: %w", err)
+					}
+					m.UpdateInterval = caddy.Duration(dur)
 					current = 0
 				case 2:
 					m.AllowCountries = append(m.AllowCountries, d.Val())
@@ -178,7 +232,7 @@ func (m *MaxmindGeolocation) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-func (MaxmindGeolocation) CaddyModule() caddy.ModuleInfo {
+func (*MaxmindGeolocation) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.matchers.maxmind_geolocation",
 		New: func() caddy.Module { return new(MaxmindGeolocation) },
@@ -187,12 +241,71 @@ func (MaxmindGeolocation) CaddyModule() caddy.ModuleInfo {
 
 func (m *MaxmindGeolocation) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
+	if m.usingGitHub() {
+		token := m.GitHubToken
+		if token == "" {
+			token = os.Getenv("GITHUB_TOKEN")
+		}
+		m.GitHubToken = token
+		if m.UpdateInterval <= 0 {
+			m.UpdateInterval = caddy.Duration(24 * time.Hour)
+		}
+		_, _, err := syncFromGitHubRelease(m.GitHubRepo, m.GitHubAsset, m.CachePath, m.GitHubToken)
+		if err != nil {
+			return fmt.Errorf("github initial sync: %w", err)
+		}
+		m.DbPath = m.CachePath
+		m.stopSync = make(chan struct{})
+		go m.runGitHubSync(m.stopSync, time.Duration(m.UpdateInterval))
+	}
 	return nil
 }
 
+func (m *MaxmindGeolocation) usingGitHub() bool {
+	return m.GitHubRepo != "" && m.GitHubAsset != "" && m.CachePath != ""
+}
+
+func (m *MaxmindGeolocation) runGitHubSync(stop <-chan struct{}, interval time.Duration) {
+	repo, asset, cache, token := m.GitHubRepo, m.GitHubAsset, m.CachePath, m.GitHubToken
+	tag, updated, err := syncFromGitHubRelease(repo, asset, cache, token)
+	if err != nil {
+		m.logger.Error("github initial sync failed", zap.String("repo", repo), zap.String("asset", asset), zap.Error(err))
+		return
+	}
+	m.logger.Info("github database synced", zap.String("repo", repo), zap.String("asset", asset), zap.String("tag", tag), zap.Bool("updated", updated))
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			tag, updated, err := syncFromGitHubRelease(repo, asset, cache, token)
+			if err != nil {
+				m.logger.Warn("github sync check failed", zap.String("repo", repo), zap.Error(err))
+				continue
+			}
+			if updated {
+				m.logger.Info("github database updated", zap.String("repo", repo), zap.String("tag", tag))
+				m.dbMu.Lock()
+				if m.dbInst != nil {
+					_ = m.dbInst.Close()
+					m.dbInst = nil
+				}
+				m.dbMu.Unlock()
+			}
+		}
+	}
+}
+
 func (m *MaxmindGeolocation) Validate() error {
+	if m.GitHubRepo != "" || m.GitHubAsset != "" || m.CachePath != "" {
+		if !m.usingGitHub() {
+			return fmt.Errorf("when using GitHub source specify all three: github_repo, github_asset, cache_path")
+		}
+	}
 	if m.DbPath == "" {
-		return fmt.Errorf("db_path is required")
+		return fmt.Errorf("db_path is required, or use github_repo + github_asset + cache_path")
 	}
 	fh, err := os.Open(m.DbPath)
 	if err != nil {
@@ -206,6 +319,12 @@ func (m *MaxmindGeolocation) Validate() error {
 }
 
 func (m *MaxmindGeolocation) Cleanup() error {
+	if m.stopSync != nil {
+		close(m.stopSync)
+		m.stopSync = nil
+	}
+	m.dbMu.Lock()
+	defer m.dbMu.Unlock()
 	if m.dbInst != nil {
 		err := m.dbInst.Close()
 		if err != nil {
@@ -276,15 +395,19 @@ func (m *MaxmindGeolocation) Match(r *http.Request) bool {
 	var record Record
 	var err error
 
+	m.dbMu.Lock()
 	if m.dbInst == nil {
 		m.dbInst, err = maxminddb.Open(m.DbPath)
 		if err != nil {
+			m.dbMu.Unlock()
 			m.logger.Error("cannot open database file", zap.String("path", m.DbPath), zap.Error(err))
 			return false
 		}
 	}
+	db := m.dbInst
+	m.dbMu.Unlock()
 
-	err = m.dbInst.Lookup(addr, &record)
+	err = db.Lookup(addr, &record)
 	if err != nil {
 		m.logger.Warn("cannot lookup IP address", zap.String("address", clientIP), zap.Error(err))
 		return false

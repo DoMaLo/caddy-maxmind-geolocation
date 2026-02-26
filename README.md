@@ -22,6 +22,8 @@ by creating an account. More information about this are available on the
 
 You will specifically need the `GeoLite2-Country.mmdb` file, or the `GeoLite2-City.mmdb` if you're matching on subdivisions and metro codes.
 
+Alternatively, you can use a database from a GitHub repository (e.g. [P3TERX/GeoLite.mmdb](https://github.com/P3TERX/GeoLite.mmdb)) that publishes GeoLite2 files as release assets. The module will download the file on startup and periodically check for updates.
+
 ## Usage
 
 You can use this module as a matcher to blacklist or whitelist a set of countries, subdivisions or metro codes. 
@@ -119,6 +121,26 @@ test.example.org {
 }
 
 ```
+
+6. Use database from GitHub (e.g. [P3TERX/GeoLite.mmdb](https://github.com/P3TERX/GeoLite.mmdb)) with automatic updates:
+```
+test.example.org {
+  @mygeofilter {
+    maxmind_geolocation {
+      github_repo "P3TERX/GeoLite.mmdb"
+      github_asset "GeoLite2-Country.mmdb"
+      cache_path "/var/lib/caddy/GeoLite2-Country.mmdb"
+      update_interval 24h
+      allow_countries IT FR
+    }
+  }
+
+   file_server @mygeofilter {
+     root /var/www/html
+   }
+}
+```
+Optional: set `GITHUB_TOKEN` env for higher API rate limit. `update_interval` defaults to 24h.
 
 ### API/JSON
 
